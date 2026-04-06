@@ -1,14 +1,15 @@
 mod common;
 
 use axum::http::StatusCode;
+use transcribe_cactus::{STATUS_PATH, TranscribeReadiness, TranscribeReadinessState};
 
 fn audio_wav_bytes() -> Vec<u8> {
     std::fs::read(hypr_data::english_1::AUDIO_PATH).expect("failed to read audio file")
 }
 
-use transcribe_cactus::TranscribeService;
-
-use common::{invalid_model_path, model_path};
+use common::{
+    invalid_model_path, start_server_with_model_path, start_test_server, wait_for_status,
+};
 
 #[ignore = "requires local cactus model files"]
 #[test]
@@ -19,22 +20,7 @@ fn e2e_batch() {
         .unwrap();
 
     rt.block_on(async {
-        let app = TranscribeService::builder()
-            .model_path(model_path())
-            .build()
-            .into_router(|err: String| async move { (StatusCode::INTERNAL_SERVER_ERROR, err) });
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
+        let (addr, shutdown_tx) = start_test_server(Default::default()).await;
 
         let wav_bytes = audio_wav_bytes();
 
@@ -83,22 +69,9 @@ fn e2e_batch() {
 
 #[tokio::test]
 async fn invalid_model_path_returns_http_500_json_error() {
-    let app = TranscribeService::builder()
-        .model_path(invalid_model_path())
-        .build()
-        .into_router(|err: String| async move { (StatusCode::INTERNAL_SERVER_ERROR, err) });
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .unwrap();
-    });
+    let (addr, shutdown_tx) =
+        start_server_with_model_path(invalid_model_path(), Default::default()).await;
+    wait_for_status(addr, TranscribeReadinessState::Failed).await;
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -127,22 +100,9 @@ async fn invalid_model_path_returns_http_500_json_error() {
 
 #[tokio::test]
 async fn invalid_model_path_returns_sse_error_event() {
-    let app = TranscribeService::builder()
-        .model_path(invalid_model_path())
-        .build()
-        .into_router(|err: String| async move { (StatusCode::INTERNAL_SERVER_ERROR, err) });
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .unwrap();
-    });
+    let (addr, shutdown_tx) =
+        start_server_with_model_path(invalid_model_path(), Default::default()).await;
+    wait_for_status(addr, TranscribeReadinessState::Failed).await;
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -165,6 +125,34 @@ async fn invalid_model_path_returns_sse_error_event() {
             .unwrap_or_default()
             .contains("model file not found"),
         "unexpected detail: {body:?}"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn health_is_live_even_when_model_failed() {
+    let (addr, shutdown_tx) =
+        start_server_with_model_path(invalid_model_path(), Default::default()).await;
+    wait_for_status(addr, TranscribeReadinessState::Failed).await;
+
+    let health = reqwest::get(format!("http://{addr}/health"))
+        .await
+        .expect("health request failed");
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(health.text().await.unwrap(), "ok");
+
+    let status = reqwest::get(format!("http://{addr}{STATUS_PATH}"))
+        .await
+        .expect("status request failed");
+    assert_eq!(status.status(), StatusCode::OK);
+    let body: TranscribeReadiness = status.json().await.expect("status is not JSON");
+    assert_eq!(body.status, TranscribeReadinessState::Failed);
+    assert!(
+        body.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("model file not found")
     );
 
     let _ = shutdown_tx.send(());

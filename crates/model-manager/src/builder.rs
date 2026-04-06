@@ -1,8 +1,8 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 
-use crate::{ModelLoader, ModelManager};
+use crate::{ModelLoader, ModelManager, manager::ManagerState};
 
 const DEFAULT_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(3);
@@ -68,8 +68,8 @@ impl<M: ModelLoader> ModelManagerBuilder<M> {
         let manager = ModelManager {
             registry: Arc::new(RwLock::new(self.models)),
             default_model: Arc::new(RwLock::new(self.default_model)),
-            active: Arc::new(Mutex::new(None)),
-            last_activity: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(ManagerState::default())),
+            load_notify: Arc::new(Notify::new()),
             inactivity_timeout,
             _drop_guard: Arc::new(DropGuard { shutdown_tx }),
         };

@@ -20514,6 +20514,7 @@ dependencies = [
  "reqwest 0.13.2",
  "rodio",
  "sequential-test",
+ "serde",
  "serde_html_form 0.4.0",
  "serde_json",
  "strum 0.27.2",

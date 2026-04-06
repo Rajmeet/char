@@ -2,6 +2,8 @@
 pub enum Error {
     #[error("failed to load model: {0}")]
     Load(Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
+    StoredLoadFailure(String),
     #[error("model not registered: {0}")]
     ModelNotRegistered(String),
     #[error("model file not found: {0}")]

@@ -1,20 +1,49 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, Notify, RwLock, watch};
 
 use crate::builder::DropGuard;
 use crate::{Error, ModelLoader};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelLoadState {
+    Idle,
+    Loading,
+    Ready,
+    Failed { error: String },
+}
 
 pub(crate) struct ActiveModel<M> {
     pub(crate) name: String,
     pub(crate) model: Arc<M>,
 }
 
+pub(crate) enum LoadState<M> {
+    Idle,
+    Loading { name: String },
+    Ready(ActiveModel<M>),
+    Failed { name: String, error: String },
+}
+
+pub(crate) struct ManagerState<M> {
+    pub(crate) load_state: LoadState<M>,
+    pub(crate) last_activity: Option<tokio::time::Instant>,
+}
+
+impl<M> Default for ManagerState<M> {
+    fn default() -> Self {
+        Self {
+            load_state: LoadState::Idle,
+            last_activity: None,
+        }
+    }
+}
+
 pub struct ModelManager<M: ModelLoader> {
     pub(crate) registry: Arc<RwLock<HashMap<String, PathBuf>>>,
     pub(crate) default_model: Arc<RwLock<Option<String>>>,
-    pub(crate) active: Arc<Mutex<Option<ActiveModel<M>>>>,
-    pub(crate) last_activity: Arc<Mutex<Option<tokio::time::Instant>>>,
+    pub(crate) state: Arc<Mutex<ManagerState<M>>>,
+    pub(crate) load_notify: Arc<Notify>,
     pub(crate) inactivity_timeout: Duration,
     pub(crate) _drop_guard: Arc<DropGuard>,
 }
@@ -24,8 +53,8 @@ impl<M: ModelLoader> Clone for ModelManager<M> {
         Self {
             registry: Arc::clone(&self.registry),
             default_model: Arc::clone(&self.default_model),
-            active: Arc::clone(&self.active),
-            last_activity: Arc::clone(&self.last_activity),
+            state: Arc::clone(&self.state),
+            load_notify: Arc::clone(&self.load_notify),
             inactivity_timeout: self.inactivity_timeout,
             _drop_guard: Arc::clone(&self._drop_guard),
         }
@@ -46,9 +75,12 @@ impl<M: ModelLoader> ModelManager<M> {
         let mut reg = self.registry.write().await;
         reg.remove(name);
 
-        let mut active = self.active.lock().await;
-        if active.as_ref().is_some_and(|a| a.name == name) {
-            *active = None;
+        let mut state = self.state.lock().await;
+        if self.is_state_for_name(&state.load_state, name) {
+            state.load_state = LoadState::Idle;
+            state.last_activity = None;
+            drop(state);
+            self.load_notify.notify_waiters();
         }
     }
 
@@ -58,62 +90,211 @@ impl<M: ModelLoader> ModelManager<M> {
     }
 
     pub async fn get(&self, name: Option<&str>) -> Result<Arc<M>, Error> {
-        let resolved = match name {
-            Some(n) => n.to_string(),
-            None => {
-                let default = self.default_model.read().await;
-                default.clone().ok_or(Error::NoDefaultModel)?
+        let resolved = self.resolve_name(name).await?;
+        let mut waited_for_load = false;
+
+        loop {
+            if let Some(model) = self.get_if_ready(Some(&resolved)).await? {
+                return Ok(model);
+            }
+
+            match self.snapshot(Some(&resolved)).await? {
+                ModelLoadState::Idle => {
+                    self.ensure_loading(Some(&resolved)).await?;
+                }
+                ModelLoadState::Loading => {}
+                ModelLoadState::Ready => continue,
+                ModelLoadState::Failed { error } if waited_for_load => {
+                    return Err(Error::StoredLoadFailure(error));
+                }
+                ModelLoadState::Failed { .. } => {
+                    self.ensure_loading(Some(&resolved)).await?;
+                }
+            }
+
+            let notified = self.load_notify.notified();
+            match self.snapshot(Some(&resolved)).await? {
+                ModelLoadState::Ready => continue,
+                ModelLoadState::Failed { error } => {
+                    return Err(Error::StoredLoadFailure(error));
+                }
+                ModelLoadState::Idle => continue,
+                ModelLoadState::Loading => {
+                    waited_for_load = true;
+                    notified.await;
+                }
+            }
+        }
+    }
+
+    pub async fn ensure_loading(&self, name: Option<&str>) -> Result<bool, Error> {
+        let resolved = self.resolve_name(name).await?;
+        let path = self.resolve_path(&resolved).await?;
+
+        let should_spawn = {
+            let mut state = self.state.lock().await;
+            let _ = self.expire_if_inactive(&mut state);
+            match self.snapshot_from_state(&state.load_state, &resolved) {
+                ModelLoadState::Ready | ModelLoadState::Loading => false,
+                ModelLoadState::Idle | ModelLoadState::Failed { .. } => {
+                    state.load_state = LoadState::Loading {
+                        name: resolved.clone(),
+                    };
+                    state.last_activity = None;
+                    true
+                }
             }
         };
 
-        let path = {
-            let reg = self.registry.read().await;
-            reg.get(&resolved)
-                .cloned()
-                .ok_or_else(|| Error::ModelNotRegistered(resolved.clone()))?
+        if !should_spawn {
+            return Ok(false);
+        }
+
+        self.load_notify.notify_waiters();
+
+        let state = Arc::clone(&self.state);
+        let load_notify = Arc::clone(&self.load_notify);
+        tokio::spawn(async move {
+            let result = Self::load_model(path).await;
+            let mut state = state.lock().await;
+            let is_current = matches!(
+                &state.load_state,
+                LoadState::Loading { name } if name == &resolved
+            );
+            if !is_current {
+                return;
+            }
+
+            match result {
+                Ok(model) => {
+                    state.load_state = LoadState::Ready(ActiveModel {
+                        name: resolved,
+                        model,
+                    });
+                    state.last_activity = Some(tokio::time::Instant::now());
+                }
+                Err(error) => {
+                    state.load_state = LoadState::Failed {
+                        name: resolved,
+                        error: error.to_string(),
+                    };
+                    state.last_activity = None;
+                }
+            }
+
+            drop(state);
+            load_notify.notify_waiters();
+        });
+
+        Ok(true)
+    }
+
+    pub async fn snapshot(&self, name: Option<&str>) -> Result<ModelLoadState, Error> {
+        let resolved = self.resolve_name(name).await?;
+        let mut state = self.state.lock().await;
+        let should_notify = self.expire_if_inactive(&mut state);
+        let snapshot = self.snapshot_from_state(&state.load_state, &resolved);
+        drop(state);
+
+        if should_notify {
+            self.load_notify.notify_waiters();
+        }
+
+        Ok(snapshot)
+    }
+
+    pub async fn get_if_ready(&self, name: Option<&str>) -> Result<Option<Arc<M>>, Error> {
+        let resolved = self.resolve_name(name).await?;
+        let mut state = self.state.lock().await;
+        let should_notify = self.expire_if_inactive(&mut state);
+
+        let model = match &state.load_state {
+            LoadState::Ready(active) if active.name == resolved => Some(Arc::clone(&active.model)),
+            _ => None,
         };
 
-        if !path.exists() {
-            return Err(Error::ModelFileNotFound(path.display().to_string()));
+        if model.is_some() {
+            state.last_activity = Some(tokio::time::Instant::now());
         }
+        drop(state);
 
-        let mut active = self.active.lock().await;
-        let mut last_activity = self.last_activity.lock().await;
-        let now = tokio::time::Instant::now();
-
-        if last_activity.is_some_and(|t| now.duration_since(t) > self.inactivity_timeout) {
-            *active = None;
+        if should_notify {
+            self.load_notify.notify_waiters();
         }
-        *last_activity = Some(now);
-
-        if let Some(ref a) = *active
-            && a.name == resolved
-        {
-            return Ok(Arc::clone(&a.model));
-        }
-
-        *active = None;
-
-        let model = tokio::task::spawn_blocking(move || M::load(&path))
-            .await
-            .map_err(|_| Error::WorkerPanicked)?
-            .map_err(|e| Error::Load(Box::new(e)))?;
-
-        let model = Arc::new(model);
-        *active = Some(ActiveModel {
-            name: resolved,
-            model: Arc::clone(&model),
-        });
 
         Ok(model)
     }
 
     pub async fn keep_alive(&self) {
-        self.update_activity().await;
+        let mut state = self.state.lock().await;
+        if matches!(state.load_state, LoadState::Ready(_)) {
+            state.last_activity = Some(tokio::time::Instant::now());
+        }
     }
 
-    async fn update_activity(&self) {
-        *self.last_activity.lock().await = Some(tokio::time::Instant::now());
+    async fn resolve_name(&self, name: Option<&str>) -> Result<String, Error> {
+        match name {
+            Some(name) => Ok(name.to_string()),
+            None => {
+                let default = self.default_model.read().await;
+                default.clone().ok_or(Error::NoDefaultModel)
+            }
+        }
+    }
+
+    async fn resolve_path(&self, name: &str) -> Result<PathBuf, Error> {
+        let reg = self.registry.read().await;
+        reg.get(name)
+            .cloned()
+            .ok_or_else(|| Error::ModelNotRegistered(name.to_string()))
+    }
+
+    async fn load_model(path: PathBuf) -> Result<Arc<M>, Error> {
+        if !path.exists() {
+            return Err(Error::ModelFileNotFound(path.display().to_string()));
+        }
+
+        let model = tokio::task::spawn_blocking(move || M::load(&path))
+            .await
+            .map_err(|_| Error::WorkerPanicked)?
+            .map_err(|error| Error::Load(Box::new(error)))?;
+
+        Ok(Arc::new(model))
+    }
+
+    fn snapshot_from_state(&self, state: &LoadState<M>, resolved: &str) -> ModelLoadState {
+        match state {
+            LoadState::Idle => ModelLoadState::Idle,
+            LoadState::Loading { name } if name == resolved => ModelLoadState::Loading,
+            LoadState::Ready(active) if active.name == resolved => ModelLoadState::Ready,
+            LoadState::Failed { name, error } if name == resolved => ModelLoadState::Failed {
+                error: error.clone(),
+            },
+            _ => ModelLoadState::Idle,
+        }
+    }
+
+    fn is_state_for_name(&self, state: &LoadState<M>, name: &str) -> bool {
+        match state {
+            LoadState::Idle => false,
+            LoadState::Loading { name: current } => current == name,
+            LoadState::Ready(active) => active.name == name,
+            LoadState::Failed { name: current, .. } => current == name,
+        }
+    }
+
+    fn expire_if_inactive(&self, state: &mut ManagerState<M>) -> bool {
+        let should_expire = matches!(state.load_state, LoadState::Ready(_))
+            && state
+                .last_activity
+                .is_some_and(|t| t.elapsed() > self.inactivity_timeout);
+
+        if should_expire {
+            state.load_state = LoadState::Idle;
+            state.last_activity = None;
+        }
+
+        should_expire
     }
 
     pub(crate) fn spawn_monitor(
@@ -121,8 +302,8 @@ impl<M: ModelLoader> ModelManager<M> {
         check_interval: Duration,
         mut shutdown_rx: watch::Receiver<()>,
     ) {
-        let active = Arc::clone(&self.active);
-        let last_activity = Arc::clone(&self.last_activity);
+        let state = Arc::clone(&self.state);
+        let load_notify = Arc::clone(&self.load_notify);
         let inactivity_timeout = self.inactivity_timeout;
 
         tokio::spawn(async move {
@@ -133,11 +314,23 @@ impl<M: ModelLoader> ModelManager<M> {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
                     _ = interval.tick() => {
-                        let last = last_activity.lock().await;
-                        if let Some(t) = *last
-                            && t.elapsed() > inactivity_timeout
-                        {
-                            *active.lock().await = None;
+                        let should_notify = {
+                            let mut state = state.lock().await;
+                            let should_expire = matches!(state.load_state, LoadState::Ready(_))
+                                && state
+                                    .last_activity
+                                    .is_some_and(|t| t.elapsed() > inactivity_timeout);
+
+                            if should_expire {
+                                state.load_state = LoadState::Idle;
+                                state.last_activity = None;
+                            }
+
+                            should_expire
+                        };
+
+                        if should_notify {
+                            load_notify.notify_waiters();
                         }
                     }
                 }

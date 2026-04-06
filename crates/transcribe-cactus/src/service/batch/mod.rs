@@ -1,7 +1,7 @@
 mod response;
 mod transcribe;
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use axum::{
     Json,
@@ -11,7 +11,6 @@ use axum::{
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use hypr_model_manager::ModelManager;
 use hypr_transcribe_core::{batch_sse_response, json_error_response};
 use owhisper_interface::ListenParams;
 use owhisper_interface::batch_sse::BatchSseMessage;
@@ -22,21 +21,9 @@ pub async fn handle_batch(
     body: Bytes,
     content_type: &str,
     params: &ListenParams,
-    manager: &ModelManager<hypr_cactus::Model>,
+    model: Arc<hypr_cactus::Model>,
     model_path: &Path,
 ) -> Response {
-    let model = match manager.get(None).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!(error = %e, "failed_to_load_model");
-            return json_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "model_load_failed",
-                e.to_string(),
-            );
-        }
-    };
-
     let model_path = model_path.to_path_buf();
     let content_type = content_type.to_string();
     let params = params.clone();
@@ -73,21 +60,9 @@ pub async fn handle_batch_sse(
     body: Bytes,
     content_type: &str,
     params: &ListenParams,
-    manager: &ModelManager<hypr_cactus::Model>,
+    model: Arc<hypr_cactus::Model>,
     model_path: &Path,
 ) -> Response {
-    let model = match manager.get(None).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!(error = %e, "failed_to_load_model");
-            return json_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "model_load_failed",
-                e.to_string(),
-            );
-        }
-    };
-
     let model_path = model_path.to_path_buf();
     let content_type = content_type.to_string();
     let params = params.clone();

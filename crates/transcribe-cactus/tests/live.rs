@@ -23,9 +23,9 @@ use tokio_tungstenite::{
 };
 
 use hypr_cactus::CloudConfig;
-use transcribe_cactus::{CactusConfig, TranscribeService};
+use transcribe_cactus::{CactusConfig, TranscribeReadinessState};
 
-use common::invalid_model_path;
+use common::{invalid_model_path, start_server_with_model_path, wait_for_status};
 
 async fn run_single_channel_opts(
     cactus_config: CactusConfig,
@@ -148,22 +148,9 @@ fn e2e_websocket_no_handoff() {
 
 #[tokio::test]
 async fn websocket_invalid_model_path_fails_before_upgrade() {
-    let app = TranscribeService::builder()
-        .model_path(invalid_model_path())
-        .build()
-        .into_router(|err: String| async move { (StatusCode::INTERNAL_SERVER_ERROR, err) });
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .unwrap();
-    });
+    let (addr, shutdown_tx) =
+        start_server_with_model_path(invalid_model_path(), Default::default()).await;
+    wait_for_status(addr, TranscribeReadinessState::Failed).await;
 
     let result = connect_async(format!(
         "ws://{}/v1/listen?channels=1&sample_rate=16000",

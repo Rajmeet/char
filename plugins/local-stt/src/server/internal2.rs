@@ -3,8 +3,8 @@ use std::{
     path::PathBuf,
 };
 
+use axum::http::StatusCode;
 use ractor::{Actor, ActorName, ActorProcessingErr, ActorRef, RpcReplyPort};
-use reqwest::StatusCode;
 use tower_http::cors::{self, CorsLayer};
 
 use super::{ServerInfo, ServerStatus};
@@ -25,6 +25,7 @@ pub struct Internal2STTArgs {
 pub struct Internal2STTState {
     server_addr: SocketAddr,
     model: CactusSttModel,
+    readiness: hypr_transcribe_cactus::TranscribeReadinessHandle,
     shutdown: tokio::sync::watch::Sender<()>,
     server_task: tokio::task::JoinHandle<()>,
 }
@@ -58,10 +59,13 @@ impl Actor for Internal2STTActor {
 
         tracing::info!(model_path = %model_path.display(), "starting internal2 STT server");
 
-        let router = hypr_transcribe_cactus::TranscribeService::builder()
+        let service = hypr_transcribe_cactus::TranscribeService::builder()
             .model_path(model_path)
             .cactus_config(cactus_config)
-            .build()
+            .build();
+        let readiness = service.readiness_handle();
+
+        let router = service
             .into_router(move |err: String| async move {
                 let _ = myself.send_message(Internal2STTMessage::ServerError(err.clone()));
                 (StatusCode::INTERNAL_SERVER_ERROR, err)
@@ -91,6 +95,7 @@ impl Actor for Internal2STTActor {
         Ok(Internal2STTState {
             server_addr,
             model: model_type,
+            readiness,
             shutdown: shutdown_tx,
             server_task,
         })
@@ -115,15 +120,23 @@ impl Actor for Internal2STTActor {
         match message {
             Internal2STTMessage::ServerError(e) => Err(e.into()),
             Internal2STTMessage::GetHealth(reply_port) => {
-                let health_url = format!(
-                    "http://{}{}",
-                    state.server_addr,
-                    hypr_transcribe_cactus::HEALTH_PATH,
-                );
-
-                let status = match reqwest::get(&health_url).await {
-                    Ok(resp) if resp.status().is_success() => ServerStatus::Ready,
-                    _ => ServerStatus::Unreachable,
+                let status = match state.readiness.snapshot().await {
+                    Ok(readiness) => match readiness.status {
+                        hypr_transcribe_cactus::TranscribeReadinessState::Idle
+                        | hypr_transcribe_cactus::TranscribeReadinessState::Loading => {
+                            ServerStatus::Loading
+                        }
+                        hypr_transcribe_cactus::TranscribeReadinessState::Ready => {
+                            ServerStatus::Ready
+                        }
+                        hypr_transcribe_cactus::TranscribeReadinessState::Failed => {
+                            ServerStatus::Unreachable
+                        }
+                    },
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed_to_read_internal2_readiness");
+                        ServerStatus::Unreachable
+                    }
                 };
 
                 let info = ServerInfo {
