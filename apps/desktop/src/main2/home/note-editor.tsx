@@ -170,28 +170,61 @@ function hasWelcomeContent(content: JSONContent): boolean {
   return JSON.stringify(firstContentNode) === JSON.stringify(firstWelcomeNode);
 }
 
-const WELCOME_NODE_COUNT = (welcomeContent.content?.length ?? 0) + 1; // +1 for separator paragraph
+const WELCOME_SEPARATOR_NODE = { type: "paragraph" };
 
 function prependWelcome(content: JSONContent): JSONContent {
   const welcomeNodes = welcomeContent.content ?? [];
   const existingNodes = content.content ?? [];
   return {
     type: "doc",
-    content: [...welcomeNodes, { type: "paragraph" }, ...existingNodes],
+    content: [...welcomeNodes, WELCOME_SEPARATOR_NODE, ...existingNodes],
   };
 }
 
 function stripWelcome(content: JSONContent): JSONContent {
-  let result = content;
-  while (hasWelcomeContent(result)) {
-    const nodes = result.content ?? [];
-    const remaining = nodes.slice(WELCOME_NODE_COUNT);
-    result = {
+  const nodes = content.content ?? [];
+  if (!hasWelcomeContent(content)) {
+    return content;
+  }
+
+  // Find the separator paragraph (empty paragraph after welcome content)
+  // and strip everything up to and including it
+  const welcomeNodesExpectedCount = welcomeContent.content?.length ?? 0;
+
+  // Look for the separator within a reasonable range (expected position +/- 5 nodes)
+  // to handle cases where user edited the welcome content
+  const searchStart = Math.max(0, welcomeNodesExpectedCount - 5);
+  const searchEnd = Math.min(nodes.length, welcomeNodesExpectedCount + 6);
+
+  let separatorIndex = -1;
+  for (let i = searchStart; i < searchEnd; i++) {
+    const node = nodes[i];
+    if (
+      node.type === "paragraph" &&
+      (!node.content || node.content.length === 0)
+    ) {
+      separatorIndex = i;
+      break;
+    }
+  }
+
+  // If we found the separator, strip up to and including it
+  if (separatorIndex >= 0) {
+    const remaining = nodes.slice(separatorIndex + 1);
+    return {
       type: "doc",
       content: remaining.length > 0 ? remaining : [{ type: "paragraph" }],
     };
   }
-  return result;
+
+  // Fallback: if no separator found but welcome content detected,
+  // strip based on expected count to avoid infinite loop
+  const expectedCount = (welcomeContent.content?.length ?? 0) + 1;
+  const remaining = nodes.slice(expectedCount);
+  return {
+    type: "doc",
+    content: remaining.length > 0 ? remaining : [{ type: "paragraph" }],
+  };
 }
 
 export function DailyNoteEditor({
