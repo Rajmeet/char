@@ -14,7 +14,7 @@ const SOCIALS = [
     label: "Discord",
     icon: "simple-icons:discord",
     size: 23,
-    url: "https://discord.gg/CX8gTH2tj9",
+    url: "https://discord.gg/atz8UzSRBM",
   },
   {
     label: "GitHub",
